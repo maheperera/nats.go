@@ -37,6 +37,7 @@ type parseState struct {
 	msgBuf    []byte
 	msgCopied bool
 	scratch   [MAX_CONTROL_LINE_SIZE]byte
+	rawBuf    []byte
 }
 
 const (
@@ -168,7 +169,7 @@ func (nc *Conn) parse(buf []byte) error {
 			if nc.ps.msgBuf != nil {
 				if len(nc.ps.msgBuf) >= nc.ps.ma.size {
 					nc.processMsg(nc.ps.msgBuf)
-					nc.ps.argBuf, nc.ps.msgBuf, nc.ps.msgCopied, nc.ps.state = nil, nil, false, MSG_END
+					nc.ps.argBuf, nc.ps.msgBuf, nc.ps.msgCopied, nc.ps.rawBuf, nc.ps.state = nil, nil, false, nil, MSG_END
 				} else {
 					// copy as much as we can to the buffer and skip ahead.
 					toCopy := nc.ps.ma.size - len(nc.ps.msgBuf)
@@ -191,7 +192,7 @@ func (nc *Conn) parse(buf []byte) error {
 				}
 			} else if i-nc.ps.as >= nc.ps.ma.size {
 				nc.processMsg(buf[nc.ps.as:i])
-				nc.ps.argBuf, nc.ps.msgBuf, nc.ps.msgCopied, nc.ps.state = nil, nil, false, MSG_END
+				nc.ps.argBuf, nc.ps.msgBuf, nc.ps.msgCopied, nc.ps.rawBuf, nc.ps.state = nil, nil, false, nil, MSG_END
 			}
 		case MSG_END:
 			switch b {
@@ -402,7 +403,13 @@ func (nc *Conn) parse(buf []byte) error {
 		if nc.ps.ma.size > cap(nc.ps.scratch)-len(nc.ps.argBuf) {
 			lrem := len(buf[nc.ps.as:])
 
-			nc.ps.msgBuf = make([]byte, lrem, nc.ps.ma.size)
+			if nc.bufPool != nil {
+				msgBuf, raw := nc.getBuffer(nc.ps.ma.size)
+				nc.ps.msgBuf = msgBuf[:lrem]
+				nc.ps.rawBuf = raw
+			} else {
+				nc.ps.msgBuf = make([]byte, lrem, nc.ps.ma.size)
+			}
 			copy(nc.ps.msgBuf, buf[nc.ps.as:])
 			nc.ps.msgCopied = true
 		} else {
@@ -414,6 +421,10 @@ func (nc *Conn) parse(buf []byte) error {
 	return nil
 
 parseErr:
+	if nc.ps.rawBuf != nil {
+		nc.releaseBuffer(nc.ps.rawBuf)
+		nc.ps.rawBuf = nil
+	}
 	return fmt.Errorf("nats: Parse Error [%d]: '%s'", nc.ps.state, buf[i:])
 }
 

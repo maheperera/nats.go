@@ -39,6 +39,9 @@ type (
 		// Data returns the message body.
 		Data() []byte
 
+		// Release returns the message payload buffer to the buffer pool, if configured.
+		Release()
+
 		// Headers returns a map of headers for a message.
 		Headers() nats.Header
 
@@ -337,6 +340,13 @@ func (m *jetStreamMsg) Metadata() (*MsgMetadata, error) {
 // Data returns the message body.
 func (m *jetStreamMsg) Data() []byte {
 	return m.msg.Data
+}
+
+// Release returns the message payload buffer to the buffer pool, if configured.
+func (m *jetStreamMsg) Release() {
+	if m.msg != nil {
+		m.msg.Release()
+	}
 }
 
 // Headers returns a map of headers for a message.

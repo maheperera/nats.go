@@ -617,6 +617,14 @@ type Options struct {
 	// can be lost on blocked writes but may significantly reduce throughput.
 	// Defaults to 32768 bytes (32KB).
 	WriteBufferSize int
+
+	// BufferPool specifies a custom buffer pool implementation for recycling
+	// message payload byte slices.
+	BufferPool BufferPool
+
+	// BufferPoolSize sets the size of the built-in tiered buffer pool per size class.
+	// When set to a positive value and BufferPool is nil, a default TieredBufferPool is configured.
+	BufferPoolSize int
 }
 
 const (
@@ -687,6 +695,11 @@ type Conn struct {
 	ar            bool // abort reconnect
 	rqch          chan struct{}
 	ws            bool // true if a websocket connection
+	bufPool       BufferPool
+	AllocBufs     uint64
+	FreedBufs     uint64
+	ReusedBufs    uint64
+	ReleasedBufs  uint64
 
 	// New style response handler
 	respSub       string               // The wildcard subject
@@ -822,6 +835,26 @@ type Msg struct {
 	wsz     int
 	barrier *barrierInfo
 	ackd    uint32
+	rawBuf  []byte
+	pool    BufferPool
+}
+
+// Release returns the message payload buffer to the buffer pool, if configured.
+// It is safe to call Release multiple times; subsequent calls are no-ops.
+// Once released, m.Data will be set to nil. The caller must ensure that m.Data
+// (or any references pointing into it) is no longer accessed.
+func (m *Msg) Release() {
+	if m == nil || m.rawBuf == nil {
+		return
+	}
+	if m.pool != nil {
+		m.pool.Put(m.rawBuf)
+		if m.Sub != nil && m.Sub.conn != nil {
+			atomic.AddUint64(&m.Sub.conn.ReleasedBufs, 1)
+		}
+	}
+	m.rawBuf = nil
+	m.Data = nil
 }
 
 // Compares two msgs, ignores sub but checks all other public fields.
@@ -1018,11 +1051,15 @@ type barrierInfo struct {
 // Tracks various stats received and sent on this connection,
 // including counts for messages and bytes.
 type Statistics struct {
-	InMsgs     uint64
-	OutMsgs    uint64
-	InBytes    uint64
-	OutBytes   uint64
-	Reconnects uint64
+	InMsgs       uint64
+	OutMsgs      uint64
+	InBytes      uint64
+	OutBytes     uint64
+	Reconnects   uint64
+	AllocBufs    uint64
+	FreedBufs    uint64
+	ReusedBufs   uint64
+	ReleasedBufs uint64
 }
 
 // Server represents a server in the pool of servers that the client can connect to.
@@ -1999,6 +2036,12 @@ func (o Options) Connect() (*Conn, error) {
 
 	if err := nc.setupServerPool(); err != nil {
 		return nil, err
+	}
+
+	if nc.Opts.BufferPool != nil {
+		nc.bufPool = nc.Opts.BufferPool
+	} else if nc.Opts.BufferPoolSize > 0 {
+		nc.bufPool = NewTieredBufferPool(nc.Opts.BufferPoolSize)
 	}
 
 	// Create the async callback handler.
@@ -3735,6 +3778,10 @@ func (nc *Conn) readLoop() {
 	}
 	// Clear the parseState here..
 	nc.mu.Lock()
+	if nc.ps != nil && nc.ps.rawBuf != nil {
+		nc.releaseBuffer(nc.ps.rawBuf)
+		nc.ps.rawBuf = nil
+	}
 	nc.ps = nil
 	nc.mu.Unlock()
 }
@@ -3824,6 +3871,7 @@ func (nc *Conn) waitForMsgs(s *Subscription) {
 			}
 			s.mu.Lock()
 		}
+		m.Release()
 		s.pHead = m.next
 	}
 	// Now check for pDone
@@ -3860,6 +3908,10 @@ func (nc *Conn) processMsg(data []byte) {
 	nc.subsMu.RUnlock()
 
 	if sub == nil {
+		if nc.ps.rawBuf != nil {
+			nc.releaseBuffer(nc.ps.rawBuf)
+			nc.ps.rawBuf = nil
+		}
 		return
 	}
 
@@ -3872,9 +3924,19 @@ func (nc *Conn) processMsg(data []byte) {
 
 	// FIXME(dlc): Need to copy, should/can do COW?
 	msgPayload := data
+	var rawBuf []byte
 	if !nc.ps.msgCopied {
-		msgPayload = make([]byte, len(data))
+		if nc.bufPool != nil {
+			var msgBuf []byte
+			msgBuf, rawBuf = nc.getBuffer(len(data))
+			msgPayload = msgBuf
+		} else {
+			msgPayload = make([]byte, len(data))
+		}
 		copy(msgPayload, data)
+	} else {
+		rawBuf = nc.ps.rawBuf
+		nc.ps.rawBuf = nil
 	}
 
 	// Check if we have headers encoded here.
@@ -3908,12 +3970,17 @@ func (nc *Conn) processMsg(data []byte) {
 		Data:    msgPayload,
 		Sub:     sub,
 		wsz:     len(data) + len(subj) + len(reply),
+		rawBuf:  rawBuf,
+		pool:    nc.bufPool,
 	}
 
 	// Check for message filters.
 	if mf != nil {
 		if m = mf(m); m == nil {
 			// Drop message.
+			if rawBuf != nil {
+				nc.releaseBuffer(rawBuf)
+			}
 			return
 		}
 	}
@@ -3923,6 +3990,7 @@ func (nc *Conn) processMsg(data []byte) {
 	// Check if closed.
 	if sub.closed {
 		sub.mu.Unlock()
+		m.Release()
 		return
 	}
 
@@ -3976,6 +4044,7 @@ func (nc *Conn) processMsg(data []byte) {
 				goto slowConsumer
 			case jsMsgDropGap:
 				sub.mu.Unlock()
+				m.Release()
 				return
 			}
 		}
@@ -4049,6 +4118,11 @@ func (nc *Conn) processMsg(data []byte) {
 		nc.checkForSequenceMismatch(m, sub, jsi)
 	}
 
+	// If it was a control message that was not delivered to the subscriber, release its buffer.
+	if ctrlMsg && (jsi == nil || !jsi.pull) {
+		m.Release()
+	}
+
 	// Check if we need to auto-unsubscribe for chan subscriptions
 	if sub.typ == ChanSubscription && sub.max > 0 && !ctrlMsg {
 		sub.mu.Lock()
@@ -4093,6 +4167,7 @@ slowConsumer:
 	} else {
 		sub.mu.Unlock()
 	}
+	m.Release()
 }
 
 // releaseReserved undoes the pending accounting reserved for m earlier in
@@ -6501,15 +6576,60 @@ func (nc *Conn) Stats() Statistics {
 	// Stats are updated either under connection's mu or with atomic operations
 	// for inbound stats in processMsg().
 	nc.mu.Lock()
+	var allocBufs, freedBufs, reusedBufs, releasedBufs uint64
+	if tb, ok := nc.bufPool.(*TieredBufferPool); ok {
+		reusedBufs, allocBufs, releasedBufs, freedBufs = tb.Stats()
+	} else {
+		allocBufs = atomic.LoadUint64(&nc.AllocBufs)
+		freedBufs = atomic.LoadUint64(&nc.FreedBufs)
+		reusedBufs = atomic.LoadUint64(&nc.ReusedBufs)
+		releasedBufs = atomic.LoadUint64(&nc.ReleasedBufs)
+	}
 	stats := Statistics{
-		InMsgs:     atomic.LoadUint64(&nc.InMsgs),
-		InBytes:    atomic.LoadUint64(&nc.InBytes),
-		OutMsgs:    nc.OutMsgs,
-		OutBytes:   nc.OutBytes,
-		Reconnects: nc.Reconnects,
+		InMsgs:       atomic.LoadUint64(&nc.InMsgs),
+		InBytes:      atomic.LoadUint64(&nc.InBytes),
+		OutMsgs:      nc.OutMsgs,
+		OutBytes:     nc.OutBytes,
+		Reconnects:   nc.Reconnects,
+		AllocBufs:    allocBufs,
+		FreedBufs:    freedBufs,
+		ReusedBufs:   reusedBufs,
+		ReleasedBufs: releasedBufs,
 	}
 	nc.mu.Unlock()
 	return stats
+}
+
+func (nc *Conn) getBuffer(size int) ([]byte, []byte) {
+	if nc.bufPool == nil {
+		b := make([]byte, size)
+		return b, nil
+	}
+	raw := nc.bufPool.Get(size)
+	if cap(raw) < size {
+		raw = make([]byte, size)
+	}
+	return raw[:size], raw
+}
+
+func (nc *Conn) releaseBuffer(raw []byte) {
+	if nc == nil || nc.bufPool == nil || raw == nil {
+		return
+	}
+	nc.bufPool.Put(raw)
+	atomic.AddUint64(&nc.ReleasedBufs, 1)
+}
+
+// ReleaseBuffer returns a byte slice to the connection's buffer pool, if configured.
+func (nc *Conn) ReleaseBuffer(buf []byte) {
+	nc.releaseBuffer(buf)
+}
+
+// ReleaseMessage returns the message payload buffer to the connection's buffer pool.
+func (nc *Conn) ReleaseMessage(m *Msg) {
+	if m != nil {
+		m.Release()
+	}
 }
 
 // MaxPayload returns the size limit that a message payload can have.
